@@ -4,7 +4,7 @@
 # Run on a fresh Ubuntu 24.04 VM (as root)
 #
 # Usage:
-#   curl -fsSL https://gist.githubusercontent.com/esauter5/13d635eab299c9a4bde76af1846e439a/raw/setup.sh | bash
+#   curl -fsSL https://gist.githubusercontent.com/esauter5/3e32fea061b53d51c524b34897bdb15d/raw/setup.sh | bash
 #
 
 set -e
@@ -25,10 +25,15 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ----------------------------
-# Configuration (edit these)
+# Configuration
 # ----------------------------
+VM_USER="${VM_USER:-claude}"
 GIT_NAME="${GIT_NAME:-}"
 GIT_EMAIL="${GIT_EMAIL:-}"
+
+# ============================
+# ROOT SECTION
+# ============================
 
 # ----------------------------
 # Security
@@ -48,7 +53,8 @@ sed -i 's/PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_c
 systemctl restart ssh
 
 log "Enabling automatic security updates..."
-echo 'Unattended-Upgrade::Automatic-Reboot "false";' >> /etc/apt/apt.conf.d/50unattended-upgrades
+grep -q "Automatic-Reboot" /etc/apt/apt.conf.d/50unattended-upgrades || \
+    echo 'Unattended-Upgrade::Automatic-Reboot "false";' >> /etc/apt/apt.conf.d/50unattended-upgrades
 
 # ----------------------------
 # Core Tools
@@ -67,21 +73,6 @@ log "Installing Claude Code..."
 npm install -g @anthropic-ai/claude-code > /dev/null 2>&1
 
 # ----------------------------
-# Git Configuration
-# ----------------------------
-if [[ -n "$GIT_NAME" ]]; then
-    log "Configuring git..."
-    git config --global user.name "$GIT_NAME"
-    git config --global user.email "$GIT_EMAIL"
-fi
-
-# Generate SSH key if it doesn't exist
-if [[ ! -f ~/.ssh/id_ed25519 ]]; then
-    log "Generating SSH key..."
-    ssh-keygen -t ed25519 -C "${GIT_EMAIL:-claude-vm}" -f ~/.ssh/id_ed25519 -N ""
-fi
-
-# ----------------------------
 # GitHub CLI
 # ----------------------------
 log "Installing GitHub CLI..."
@@ -91,6 +82,63 @@ echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githu
 apt-get update -qq
 apt-get install -y -qq gh > /dev/null
 
+# ----------------------------
+# Create User
+# ----------------------------
+if ! id "$VM_USER" &>/dev/null; then
+    log "Creating user '$VM_USER'..."
+    adduser --disabled-password --gecos "" "$VM_USER"
+    usermod -aG sudo "$VM_USER"
+    echo "$VM_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$VM_USER
+    chmod 440 /etc/sudoers.d/$VM_USER
+else
+    log "User '$VM_USER' already exists"
+fi
+
+# Copy SSH authorized_keys to new user
+log "Copying SSH keys to $VM_USER..."
+USER_HOME="/home/$VM_USER"
+mkdir -p "$USER_HOME/.ssh"
+cp ~/.ssh/authorized_keys "$USER_HOME/.ssh/"
+chown -R "$VM_USER:$VM_USER" "$USER_HOME/.ssh"
+chmod 700 "$USER_HOME/.ssh"
+chmod 600 "$USER_HOME/.ssh/authorized_keys"
+
+# ============================
+# USER SECTION (runs as $VM_USER)
+# ============================
+log "Configuring user environment..."
+
+sudo -u "$VM_USER" GIT_NAME="$GIT_NAME" GIT_EMAIL="$GIT_EMAIL" bash << 'USEREOF'
+set -e
+
+# Colors (re-define for subshell)
+GREEN='\033[0;32m'
+NC='\033[0m'
+log() { echo -e "${GREEN}[+]${NC} $1"; }
+
+cd ~
+
+# ----------------------------
+# Git Configuration
+# ----------------------------
+if [[ -n "$GIT_NAME" ]]; then
+    log "Configuring git..."
+    git config --global user.name "$GIT_NAME"
+    git config --global user.email "$GIT_EMAIL"
+fi
+
+# ----------------------------
+# SSH Key
+# ----------------------------
+if [[ ! -f ~/.ssh/id_ed25519 ]]; then
+    log "Generating SSH key..."
+    ssh-keygen -t ed25519 -C "${GIT_EMAIL:-claude-vm}" -f ~/.ssh/id_ed25519 -N ""
+fi
+
+# ----------------------------
+# GitHub Auth
+# ----------------------------
 log "Authenticating with GitHub..."
 echo "Complete the browser auth flow to continue."
 gh auth login -p https -h github.com -s admin:public_key -w
@@ -102,7 +150,7 @@ gh ssh-key add ~/.ssh/id_ed25519.pub --title "claude-vm"
 # Tmux Configuration
 # ----------------------------
 log "Configuring tmux..."
-cat > ~/.tmux.conf << 'EOF'
+cat > ~/.tmux.conf << 'TMUXEOF'
 # Prefix: Ctrl-a (easier than Ctrl-b)
 unbind C-b
 set -g prefix C-a
@@ -139,13 +187,16 @@ bind h select-pane -L
 bind j select-pane -D
 bind k select-pane -U
 bind l select-pane -R
-EOF
+TMUXEOF
 
 # ----------------------------
 # Bash Configuration
 # ----------------------------
 log "Configuring bash..."
-cat >> ~/.bashrc << 'EOF'
+
+# Only add if not already present
+if ! grep -q "Claude Remote Setup" ~/.bashrc; then
+cat >> ~/.bashrc << 'BASHEOF'
 
 # --- Claude Remote Setup ---
 
@@ -157,6 +208,7 @@ fi
 # Aliases
 alias c='claude'
 alias cc='claude --continue'
+alias cds='claude --dangerously-skip-permissions'
 
 # Colored prompt showing we're on remote
 PS1='\[\e[32m\]\u@claude-vm\[\e[0m\]:\[\e[34m\]\w\[\e[0m\]\$ '
@@ -168,12 +220,15 @@ HISTCONTROL=ignoreboth:erasedups
 shopt -s histappend
 
 # --- End Claude Remote Setup ---
-EOF
+BASHEOF
+fi
 
 # ----------------------------
 # Projects directory
 # ----------------------------
 mkdir -p ~/projects
+
+USEREOF
 
 # ----------------------------
 # Summary
@@ -185,9 +240,16 @@ echo "=========================================="
 echo ""
 echo "Next steps:"
 echo ""
-echo "1. Authenticate Claude Code:"
-echo "   claude"
+echo "1. Update your SSH config to use the new user:"
+echo "   Host claude-vm"
+echo "       HostName <your-vm-ip>"
+echo "       User $VM_USER"
 echo ""
-echo "2. Reconnect to SSH (to start tmux automatically)"
+echo "2. Reconnect: ssh claude-vm"
+echo ""
+echo "3. Authenticate Claude: claude"
+echo ""
+echo "4. Use --dangerously-skip-permissions:"
+echo "   cds  # alias for claude --dangerously-skip-permissions"
 echo ""
 echo "=========================================="
